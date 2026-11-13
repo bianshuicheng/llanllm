@@ -1,0 +1,63 @@
+[package]
+name = "llanllm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "llanllm_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# 两个角色各自的可执行入口，产物名不同可并存（dev 联调必需）
+[[bin]]
+name = "llanllm-master"
+path = "src/bin/master.rs"
+required-features = ["master"]
+
+[[bin]]
+name = "llanllm-agent"
+path = "src/bin/agent.rs"
+required-features = ["agent"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+# default 为空：主控/被控必须显式传 feature（tauri build --features agent 会连带
+# 启用 default，default 里放 master 会导致双 feature 冲突）
+default = []
+master = []
+agent = []
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand = "0.8"
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+if-addrs = "0.15"
+hostname = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+futures-util = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+  "Win32_Security_Cryptography",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+] }

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "LLM主控台",
+  "version": "0.1.0",
+  "identifier": "com.llanllm.master",
+  "build": {
+    "beforeDevCommand": "npm run dev:web",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build:web",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "LLM 局域网推理 · 主控台",
+        "width": 1240,
+        "height": 800,
+        "minWidth": 980,
+        "minHeight": 640
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
+    "resources": {
+      "binaries/runtime/*": "runtime/"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "./installer-hooks-master.nsh",
+        "installMode": "perMachine"
+      }
+    }
+  }
+}
