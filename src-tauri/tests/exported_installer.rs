@@ -66,13 +66,23 @@ fn installer_hook_writes_config() {
     // VC 运行库随包
     assert!(inst_dir.join("runtime").join("vcruntime140.dll").exists());
 
-    // 4) 清理：静默卸载（PREUNINSTALL 钩子应删掉 config.json）
+    // 4) 清理：静默卸载（PREUNINSTALL 钩子应删掉 config.json）。
+    // NSIS 卸载器 /S 会重启自身（Au_.exe）并让父进程立即返回——删除是异步完成的，
+    // 必须轮询等待，否则断言会偶发失败。
     let un = inst_dir.join("uninstall.exe");
     if un.exists() {
         let _ = Command::new(&un).arg("/S").status();
     }
+    let mut gone = false;
+    for _ in 0..40 {
+        if !config.exists() {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
     assert!(
-        !config.exists(),
+        gone,
         "卸载后 config.json 应被 PREUNINSTALL 钩子删除"
     );
     let _ = std::fs::remove_file(&injected);
