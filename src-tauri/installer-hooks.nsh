@@ -15,6 +15,25 @@
 ; 注册 StrFunc 的行尾裁剪宏（模板已 include StrFunc.nsh）
 ${StrTrimNewLines}
 
+; 剥掉变量里的前导零（破坏式修改）。**NSIS IntOp 把前导零当八进制解析**
+; （"000239" → "00023" 的八进制 = 19！），注入长度必须先剥零再 IntOp。
+!macro LLanStripZeros var
+  ${Do}
+    StrCpy $R8 ${var} 1 0
+    ${If} $R8 == "0"
+      StrLen $R9 ${var}
+      ${If} $R9 <= 1
+        StrCpy ${var} "0"
+        ${Break}
+      ${EndIf}
+      IntOp $R9 $R9 - 1
+      StrCpy ${var} ${var} $R9 1
+    ${Else}
+      ${Break}
+    ${EndIf}
+  ${Loop}
+!macroend
+
 ; 读安装器尾部定长 18 字节：$1=json_len(6位) $2=ip_len(4位) $3=magic(8字符)
 ; 输入：$0 = 文件句柄，已 FileSeek -18 END
 !macro LLanReadTail
@@ -45,6 +64,9 @@ ${StrTrimNewLines}
     FileSeek $0 -18 END
     !insertmacro LLanReadTail
     ${If} $3 == "LLANCFG3"
+      ; 先剥前导零：IntOp 会把 "000239" 当八进制（实际=19），导致 seek 偏移全错
+      !insertmacro LLanStripZeros $1
+      !insertmacro LLanStripZeros $2
       IntOp $4 $1 + 0   ; json_len（十进制 ASCII → 数字）
       IntOp $5 $2 + 0   ; ip_len
       IntOp $6 $4 + $5
