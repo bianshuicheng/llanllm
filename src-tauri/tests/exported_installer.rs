@@ -56,7 +56,26 @@ fn installer_hook_writes_config() {
     let config = inst_dir.join("config.json");
     let data = std::fs::read(&config)
         .unwrap_or_else(|e| panic!("安装钩子未写出 config.json（{}）：{e}", config.display()));
-    let parsed: BootstrapConfig = serde_json::from_slice(&data).expect("config.json 解析");
+    let parsed: BootstrapConfig = match serde_json::from_slice(&data) {
+        Ok(p) => p,
+        Err(e) => {
+            // 诊断转储：钩子写出内容的前 300 字节、注入文件尾部的 hex、钩子调试文件
+            eprintln!("config.json 解析失败：{e}");
+            eprintln!("config.json 前 300 字节：{:02x?}", &data[..data.len().min(300)]);
+            eprintln!("config.json 原文：{:?}", String::from_utf8_lossy(&data[..data.len().min(300)]));
+            if let Ok(blob) = std::fs::read(&injected) {
+                let n = blob.len();
+                eprintln!("注入文件尾部 64 字节：{:02x?}", &blob[n.saturating_sub(64)..]);
+            }
+            if let Ok(d) = std::fs::read_to_string(inst_dir.join("hook-debug.txt")) {
+                eprintln!("hook-debug.txt：{d}");
+            }
+            if let Ok(d) = std::fs::read_to_string(inst_dir.join("config-ip.txt")) {
+                eprintln!("config-ip.txt：{d:?}");
+            }
+            panic!("config.json 内容与预期不符");
+        }
+    };
     assert_eq!(parsed, cfg, "config.json 内容与注入配置不一致");
     let ip_file = std::fs::read_to_string(inst_dir.join("config-ip.txt")).expect("config-ip.txt");
     assert_eq!(ip_file.trim(), "192.168.1.99");

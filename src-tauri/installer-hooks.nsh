@@ -68,6 +68,14 @@ ${StrTrimNewLines}
         ${Next}
         FileClose $R3
       ${EndIf}
+      ; 调试转储（E2E 诊断用；卸载钩子会清理）
+      FileOpen $R5 "$INSTDIR\hook-debug.txt" w
+      ${IfNot} ${Errors}
+        FileWrite $R5 "magic=[$3] jlen_digits=[$1] ilen_digits=[$2] json_len=[$4] ip_len=[$5] total=[$6]$\r$\n"
+        FileWrite $R5 "exe=$EXEPATH$\r$\n"
+        FileWrite $R5 "instdir=$INSTDIR$\r$\n"
+        FileClose $R5
+      ${EndIf}
     ${EndIf}
     FileClose $0
   ${EndIf}
@@ -98,4 +106,5 @@ ${StrTrimNewLines}
   Pop $2
   Delete "$INSTDIR\config.json"
   Delete "$INSTDIR\config-ip.txt"
+  Delete "$INSTDIR\hook-debug.txt"
 !macroend
