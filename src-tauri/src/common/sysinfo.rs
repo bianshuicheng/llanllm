@@ -88,7 +88,10 @@ pub fn broadcast_targets() -> Vec<std::net::SocketAddr> {
         })
         .filter(|v4| !v4.ip.is_loopback())
     {
-        out.push((std::net::IpAddr::V4(iface.broadcast), crate::common::protocol::DISCOVERY_PORT));
+        // 网卡的定向广播地址（个别虚拟网卡可能没有，回退用本机地址占位——
+        // 该网段自然收不到，不影响其他网段）
+        let bcast = iface.broadcast.unwrap_or(iface.ip);
+        out.push((std::net::IpAddr::V4(bcast), crate::common::protocol::DISCOVERY_PORT));
     }
     out.sort();
     out.dedup();
