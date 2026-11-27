@@ -86,10 +86,12 @@ jobs:
       - name: Sanity-check master installer payload
         shell: pwsh
         run: |
-          $p = "src-tauri/target/release/bundle/nsis/LLM主控台_0.1.1_x64-setup.exe"
-          if (-not (Test-Path $p)) { throw "master installer missing" }
-          $size = (Get-Item $p).Length
-          Write-Host "master installer: $size bytes"
+          $src = Get-ChildItem "src-tauri/target/release/bundle/nsis/LLM主控台_*.exe" | Select-Object -First 1
+          if (-not $src) { throw "master installer missing" }
+          $dst = "src-tauri/target/release/bundle/nsis/LLM-Master-Console_" + $src.Name.Split('_')[1] + "_x64-setup.exe"
+          Copy-Item $src.FullName $dst -Force
+          $size = (Get-Item $dst).Length
+          Write-Host "master installer: $dst = $size bytes"
           if ($size -gt 150MB) { throw "master installer over 150MB budget" }
           $a = "src-tauri/target/release/bundle/nsis/LLM被控端_0.1.1_x64-setup.exe"
           if ((Get-Item $a).Length -gt 80MB) { throw "agent installer over 80MB budget" }
@@ -98,6 +100,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            src-tauri/target/release/bundle/nsis/LLM主控台_0.1.1_x64-setup.exe
+            src-tauri/target/release/bundle/nsis/LLM-Master-Console_*.exe
           body_path: .github/RELEASE_BODY.md
           fail_on_unmatched_files: true
