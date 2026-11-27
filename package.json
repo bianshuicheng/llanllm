@@ -9,7 +9,7 @@
     "dev:master": "tauri dev --features master",
     "dev:agent": "tauri dev --config src-tauri/tauri.agent.conf.json --features agent",
     "build:web": "vite build",
-    "build:master": "tauri build --features master",
+    "build:master": "tauri build --config src-tauri/tauri.master.conf.json --features master",
     "build:agent": "tauri build --config src-tauri/tauri.agent.conf.json --features agent",
     "icon": "tauri icon"
   },

@@ -27,9 +27,6 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
-    "resources": {
-      "binaries/runtime-master/*": "runtime/"
-    },
     "windows": {
       "webviewInstallMode": {
         "type": "embedBootstrapper"
