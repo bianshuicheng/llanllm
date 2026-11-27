@@ -16,7 +16,6 @@ fn sample_cfg() -> BootstrapConfig {
         master_id: "ci-master-id".into(),
         master_name: "CI-主控-测试".into(),
         master_ip: "192.168.1.99".into(),
-        pin: String::new(),
         token_id: "0123456789abcdef".into(),
         token: "00112233445566778899aabbccddeeff".into(),
         discovery_port: 47890,

@@ -98,7 +98,7 @@ async fn try_pair(
     let ack = read_json_frame::<HandshakeMsg>(&mut stream)
         .await
         .map_err(|e| format!("读取 PairAck 失败: {e}"))?;
-    let (epk, master_name, master_id) = match ack {
+    let (epk, _master_name, master_id) = match ack {
         HandshakeMsg::PairAck { epk, master_name, master_id } => (epk, master_name, master_id),
         HandshakeMsg::PairFail { reason } => return Err(reason),
         _ => return Err("主控应答异常".into()),
@@ -368,7 +368,7 @@ async fn dispatch(state: &Arc<AgentState>, req: &CtlRequest) -> CtlResponse {
             let st = Arc::clone(state);
             tauri::async_runtime::spawn(async move {
                 match crate::agent::firewall::apply_scoped_rules(&ips) {
-                    Ok(()) => st.push_ui_log("防火墙规则已更新（仅主控可访问 50052）"),
+                    Ok(()) => st.push_ui_log("防火墙规则已更新（仅主控可访问 50052）".to_string()),
                     Err(e) => st.push_ui_log(format!("防火墙规则失败：{e}")),
                 }
                 st.emit_state();

@@ -79,7 +79,7 @@ pub fn broadcast_targets() -> Vec<std::net::SocketAddr> {
         std::net::IpAddr::V4(Ipv4Addr::BROADCAST),
         crate::common::protocol::DISCOVERY_PORT,
     )];
-    for ip in if_addrs::get_if_addrs()
+    for iface in if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|i| match i.addr {
@@ -88,8 +88,7 @@ pub fn broadcast_targets() -> Vec<std::net::SocketAddr> {
         })
         .filter(|v4| !v4.ip.is_loopback())
     {
-        let bcast = v4.broadcast;
-        out.push((std::net::IpAddr::V4(bcast), crate::common::protocol::DISCOVERY_PORT));
+        out.push((std::net::IpAddr::V4(iface.broadcast), crate::common::protocol::DISCOVERY_PORT));
     }
     out.sort();
     out.dedup();

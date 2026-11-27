@@ -55,7 +55,6 @@ pub fn create_bootstrap(state: &Arc<AppState>, label: &str) -> Result<BootstrapC
         master_name: state.master_name.clone(),
         // 导出时主用网卡 IP（装虚拟机/VPN 的机器上比 local_ips()[0] 可靠）
         master_ip: crate::common::sysinfo::primary_ip().unwrap_or_default(),
-        pin: String::new(),
         token_id,
         token,
         discovery_port: DISCOVERY_PORT,

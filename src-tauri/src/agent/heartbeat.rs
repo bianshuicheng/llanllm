@@ -7,7 +7,7 @@
 
 use crate::agent::state::AgentState;
 use crate::common::protocol::{
-    verify_presence, HeartbeatBase, HeartbeatSigned, PresenceSigned, DISCOVERY_PORT, PROTO_VERSION,
+    verify_presence, HeartbeatBase, HeartbeatSigned, PresenceSigned, PROTO_VERSION,
 };
 use std::sync::Arc;
 use std::time::Duration;
