@@ -108,6 +108,8 @@ pub fn run() {
             master_cache_info,
             allow_discovery_firewall,
             export_agent_installer,
+            list_bootstrap_tokens,
+            revoke_bootstrap_token,
             hf_list_files,
             hf_download,
             hf_cancel,
@@ -134,11 +136,17 @@ pub struct MasterInfo {
     pub cache_dir: String,
     pub cache_bytes: u64,
     pub version: String,
+    /// llama.cpp 运行时自检（缺 VC++ 运行库等问题的显式提示）
+    pub runtime_ok: bool,
+    pub runtime_message: String,
+    /// 本机各网卡 IP（导出被控端时注入的是主用 IP）
+    pub local_ips: Vec<String>,
 }
 
 #[tauri::command]
 pub fn get_master_info(state: State<'_, Arc<AppState>>) -> MasterInfo {
     let cache_dir = paths::cache_dir();
+    let check = crate::common::sysinfo::runtime_selfcheck();
     MasterInfo {
         master_id: state.master_id.clone(),
         master_name: state.master_name.clone(),
@@ -146,6 +154,9 @@ pub fn get_master_info(state: State<'_, Arc<AppState>>) -> MasterInfo {
         cache_dir: cache_dir.to_string_lossy().into_owned(),
         cache_bytes: models::dir_size(&cache_dir),
         version: crate::common::sysinfo::app_version(),
+        runtime_ok: check.ok,
+        runtime_message: check.message,
+        local_ips: crate::common::sysinfo::local_ips(),
     }
 }
 
@@ -322,8 +333,68 @@ pub fn open_dir(path: String) -> Result<(), String> {
 
 // ———————— 推理服务 ————————
 
+/// 收集 RPC 拨号目标：对每个在线已配对节点发起一次 rpc.targets 询问，
+/// 优先用控制会话的真实对端 IP（多网卡机器上比心跳 IP 列表可靠），
+/// 问不通（节点恰好断线等）回退到会话对端 IP。同时刷新节点的显存占用。
+async fn collect_rpc_targets(state: &Arc<AppState>) -> Vec<String> {
+    let sessions: Vec<(String, Arc<crate::master::ctl_server::CtlSession>)> = {
+        let nodes = state.nodes.lock().unwrap();
+        let sessions = state.ctl_sessions.lock().unwrap();
+        nodes
+            .values()
+            .filter(|n| n.paired && n.last_seen.elapsed() < std::time::Duration::from_secs(7))
+            .filter_map(|n| {
+                sessions
+                    .get(&n.info.id)
+                    .map(|s| (n.info.id.clone(), Arc::clone(s)))
+            })
+            .collect()
+    };
+    let mut out = Vec::new();
+    for (node_id, session) in sessions {
+        let fallback = format!(
+            "{}:{}",
+            session.peer_ip,
+            crate::common::protocol::RPC_PORT_DEFAULT
+        );
+        let target = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.request("rpc.targets", serde_json::json!({})),
+        )
+        .await
+        {
+            Ok(Ok(v)) => {
+                if let Some(free) = v.get("vram_free_mb").and_then(|x| x.as_u64()) {
+                    let mut nodes = state.nodes.lock().unwrap();
+                    if let Some(live) = nodes.get_mut(&node_id) {
+                        live.info.vram_free_mb = Some(free);
+                    }
+                }
+                let ip = v
+                    .get("ips")
+                    .and_then(|x| x.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|x| x.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| session.peer_ip.clone());
+                let port = v
+                    .get("rpc_port")
+                    .and_then(|x| x.as_u64())
+                    .map(|x| x as u16)
+                    .unwrap_or(crate::common::protocol::RPC_PORT_DEFAULT);
+                format!("{ip}:{port}")
+            }
+            _ => fallback,
+        };
+        if !target.starts_with(':') {
+            out.push(target);
+        }
+    }
+    out
+}
+
 #[tauri::command]
-pub fn llama_start(
+pub async fn llama_start(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     model_id: String,
@@ -331,6 +402,12 @@ pub fn llama_start(
     ngl: i32,
     port: u16,
 ) -> Result<state::LlamaStatusView, String> {
+    // 运行时自检先行：干净机器缺 VC++ 运行库时给出明确中文原因，而不是黑盒失败
+    let check = crate::common::sysinfo::runtime_selfcheck();
+    if !check.ok {
+        return Err(format!("llama.cpp 运行时不可用：{}", check.message));
+    }
+
     let model = state.db.get_model(&model_id).ok_or("模型条目不存在")?;
     let status = state.validate_model(&model);
     if status != "ok" {
@@ -347,16 +424,8 @@ pub fn llama_start(
         });
     }
 
-    // 自动收集所有在线已配对节点
-    let targets: Vec<String> = {
-        let nodes = state.nodes.lock().unwrap();
-        nodes
-            .values()
-            .filter(|n| n.paired && n.last_seen.elapsed() < std::time::Duration::from_secs(7))
-            .map(|n| format!("{}:{}", n.info.ips.first().cloned().unwrap_or_default(), n.info.rpc_port))
-            .filter(|s| !s.starts_with(':'))
-            .collect()
-    };
+    // 自动收集所有在线已配对节点（真实连接 IP 优先）
+    let targets: Vec<String> = collect_rpc_targets(state.inner()).await;
 
     llama::start_llama(
         app,
@@ -458,6 +527,19 @@ fn master_firewall_rules_present() -> bool {
     .unwrap_or(false)
 }
 
+/// 主控防火墙脚本：UDP 47890（心跳入站）+ TCP 47891（被控控制连接入站）。
+/// profile=any：Windows 把家庭/办公网判成「公用」时（v0.1.0 的实际故障）规则也生效；
+/// 入站来源用 localsubnet 限制到本网段，不因 profile=any 扩大暴露面。
+fn master_firewall_script() -> String {
+    format!(
+        r#"netsh advfirewall firewall delete rule name="{FW_RULE_DISCOVERY}"
+netsh advfirewall firewall delete rule name="{FW_RULE_CTL}"
+netsh advfirewall firewall add rule name="{FW_RULE_DISCOVERY}" dir=in action=allow protocol=UDP localport=47890 remoteip=localsubnet profile=any
+netsh advfirewall firewall add rule name="{FW_RULE_CTL}" dir=in action=allow protocol=TCP localport=47891 remoteip=localsubnet profile=any
+"#
+    )
+}
+
 /// 启动时自动放行主控端口（UDP 47890 心跳入站 + TCP 47891 被控控制连接入站）。
 /// 规则已存在则跳过（不重复弹 UAC）。
 async fn auto_open_firewall(app: AppHandle, _state: Arc<AppState>) {
@@ -467,16 +549,8 @@ async fn auto_open_firewall(app: AppHandle, _state: Arc<AppState>) {
         })).ok();
         return;
     }
-    let script = paths::data_dir().join("fw-master-auto.ps1");
-    let content = format!(
-        r#"$ErrorActionPreference = 'Stop'
-netsh advfirewall firewall delete rule name="{FW_RULE_DISCOVERY}" | Out-Null
-netsh advfirewall firewall delete rule name="{FW_RULE_CTL}" | Out-Null
-netsh advfirewall firewall add rule name="{FW_RULE_DISCOVERY}" dir=in action=allow protocol=UDP localport=47890 profile=private,domain | Out-Null
-netsh advfirewall firewall add rule name="{FW_RULE_CTL}" dir=in action=allow protocol=TCP localport=47891 profile=private,domain | Out-Null
-Write-Output "OK"
-"#
-    );
+    let script = paths::data_dir().join("fw-master-auto.cmd");
+    let content = master_firewall_script();
     if std::fs::write(&script, content).is_err() {
         app.emit("firewall-status", serde_json::json!({
             "ok": false, "message": "无法写入防火墙脚本（数据目录不可写）"
@@ -487,7 +561,7 @@ Write-Output "OK"
         "ok": false,
         "message": "正在自动放行主控端口（UDP 47890 / TCP 47891），请在弹出的管理员确认框中点「是」…"
     })).ok();
-    match crate::common::elevate::run_elevated_script(&script, "放行主控端口") {
+    match crate::common::elevate::run_elevated_cmd(&script, "放行主控端口") {
         Ok(_) => {
             app.emit("firewall-status", serde_json::json!({
                 "ok": true, "message": "已自动放行主控端口（UDP 47890 / TCP 47891）"
@@ -505,19 +579,10 @@ Write-Output "OK"
 /// 手动重试放行（设置页/节点页按钮）
 #[tauri::command]
 pub fn allow_discovery_firewall(app: AppHandle) -> Result<String, String> {
-    let script = paths::data_dir().join("fw-master-manual.ps1");
-    let content = format!(
-        r#"$ErrorActionPreference = 'Stop'
-netsh advfirewall firewall delete rule name="{FW_RULE_DISCOVERY}" | Out-Null
-netsh advfirewall firewall delete rule name="{FW_RULE_CTL}" | Out-Null
-netsh advfirewall firewall add rule name="{FW_RULE_DISCOVERY}" dir=in action=allow protocol=UDP localport=47890 profile=private,domain | Out-Null
-netsh advfirewall firewall add rule name="{FW_RULE_CTL}" dir=in action=allow protocol=TCP localport=47891 profile=private,domain | Out-Null
-Write-Output "OK"
-"#
-    );
-    std::fs::write(&script, content).map_err(|e| format!("写脚本失败: {e}"))?;
-    crate::common::elevate::run_elevated_script(&script, "放行主控端口")
-        .map(|_| "已放行 UDP 47890（发现）与 TCP 47891（被控控制连接），限专用/域网络".to_string())
+    let script = paths::data_dir().join("fw-master-manual.cmd");
+    std::fs::write(&script, master_firewall_script()).map_err(|e| format!("写脚本失败: {e}"))?;
+    crate::common::elevate::run_elevated_cmd(&script, "放行主控端口")
+        .map(|_| "已放行 UDP 47890（发现）与 TCP 47891（被控控制连接），全部网络类型、限本网段".to_string())
         .map_err(|e| {
             app.emit("firewall-error", e.clone()).ok();
             e
@@ -530,6 +595,7 @@ Write-Output "OK"
 pub fn export_agent_installer(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
+    label: Option<String>,
 ) -> Result<String, String> {
     let template = export::locate_template().ok_or_else(|| {
         "未找到被控端安装器模板。请先构建被控端安装包（agent-installer.exe）并放到主控程序目录。"
@@ -548,15 +614,54 @@ pub fn export_agent_installer(
         None => return Err("已取消".into()),
     };
 
-    let cfg = export::create_bootstrap(state.inner())?;
+    // 每次导出生成新的长期引导码并落库（主控重启后依然有效，可在导出记录里作废）
+    let cfg = export::create_bootstrap(state.inner(), &label.unwrap_or_else(|| "导出安装包".into()))?;
     let size = export::inject_and_write(Path::new(&template), &cfg, Path::new(&out))?;
 
     Ok(format!(
-        "已导出被控端安装包：{}\n大小 {:.1} MB，引导 PIN {}（30 分钟内安装自动入网）。\n把它拷贝到新电脑双击安装即可。",
+        "已导出被控端安装包：{}\n大小 {:.1} MB。\n引导码长期有效（可在「导出记录」中作废）；\
+         把该文件拷到新电脑双击安装，装完启动即自动入网，无需输入 PIN。",
         out,
         size as f64 / 1048576.0,
-        cfg.pin
     ))
+}
+
+// ———————— 导出记录（引导码管理） ————————
+
+#[derive(serde::Serialize)]
+pub struct BootstrapTokenView {
+    pub id: String,
+    pub label: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub use_count: i64,
+    pub last_used_at: Option<i64>,
+}
+
+#[tauri::command]
+pub fn list_bootstrap_tokens(state: State<'_, Arc<AppState>>) -> Vec<BootstrapTokenView> {
+    state
+        .db
+        .list_tokens()
+        .into_iter()
+        .map(|t| BootstrapTokenView {
+            id: t.id,
+            label: t.label,
+            created_at: t.created_at,
+            expires_at: t.expires_at,
+            use_count: t.use_count,
+            last_used_at: t.last_used_at,
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub fn revoke_bootstrap_token(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<String, String> {
+    state.db.delete_token(&id)?;
+    Ok("已作废该引导码。用它导出的安装包将无法自动入网（已装好并配对的节点不受影响）。".into())
 }
 
 // ———————— HuggingFace 下载 ————————

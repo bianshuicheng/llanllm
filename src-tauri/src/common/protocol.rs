@@ -91,7 +91,8 @@ pub fn verify_presence(signed: &PresenceSigned) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t")]
 pub enum HandshakeMsg {
-    /// 被控→主控：发起配对（被控持有 PIN：手动输入或安装包注入）
+    /// 被控→主控：发起配对（被控持有凭证：安装包注入的引导码或手动输入的 PIN）
+    /// token_id：引导码指纹（非机密）；PIN 配对时为空串
     PairHello {
         id: String,
         epk: String,
@@ -100,6 +101,8 @@ pub enum HandshakeMsg {
         gpu: Option<String>,
         vram_total_mb: Option<u64>,
         version: String,
+        #[serde(default)]
+        token_id: String,
     },
     /// 主控→被控：应答配对（主控有待验证的 PIN）
     PairAck {

@@ -20,6 +20,9 @@ pub struct AgentState {
     master_name: Mutex<Option<String>>,
     master_ip: Mutex<Option<String>>,
     pending_pin: Mutex<Option<(String, Instant)>>,
+    /// 安装包注入的引导码：(指纹, 引导码本体)。配对握手时随 PairHello 上送。
+    /// 长期有效（可被主控作废），不设本地 TTL。
+    bootstrap: Mutex<Option<(String, String)>>,
     rpc_port_setting: AtomicU16,
     ui_logs: Mutex<Vec<String>>,
     app: Mutex<Option<tauri::AppHandle>>,
@@ -58,6 +61,7 @@ impl AgentState {
             master_name: Mutex::new(master_name),
             master_ip: Mutex::new(master_ip),
             pending_pin: Mutex::new(None),
+            bootstrap: Mutex::new(None),
             rpc_port_setting: AtomicU16::new(rpc_port),
             ui_logs: Mutex::new(Vec::new()),
             app: Mutex::new(None),
@@ -162,6 +166,21 @@ impl AgentState {
         *self.pending_pin.lock().unwrap() = None;
     }
 
+    /// 记录安装包注入的引导码（指纹 + 本体），供配对握手使用
+    pub fn set_bootstrap(&self, token_id: &str, token: &str) {
+        *self.bootstrap.lock().unwrap() = Some((token_id.to_string(), token.to_string()));
+    }
+
+    /// 查看当前引导码（不消费）
+    pub fn peek_bootstrap(&self) -> Option<(String, String)> {
+        self.bootstrap.lock().unwrap().clone()
+    }
+
+    /// 清除引导码（配对成功后）
+    pub fn clear_bootstrap(&self) {
+        *self.bootstrap.lock().unwrap() = None;
+    }
+
     pub fn is_paired(&self) -> bool {
         self.node_key().is_some()
     }
@@ -211,6 +230,7 @@ impl AgentState {
         *self.master_id.lock().unwrap() = None;
         *self.master_name.lock().unwrap() = None;
         *self.master_ip.lock().unwrap() = None;
+        *self.bootstrap.lock().unwrap() = None;
         let _ = self.db.set_setting("master_id", "");
         let _ = self.db.set_setting("master_name", "");
         let _ = self.db.set_setting("master_ip", "");
@@ -288,6 +308,8 @@ impl AgentState {
 
     pub fn status_view(&self) -> serde_json::Value {
         let (rpc_running, rpc_pid, rpc_uptime, rpc_port) = self.rpc.status();
+        let master_ip = self.master_ip().unwrap_or_default();
+        let selfcheck = crate::common::sysinfo::runtime_selfcheck();
         serde_json::json!({
             "id": self.id,
             "hostname": crate::common::sysinfo::hostname(),
@@ -308,7 +330,10 @@ impl AgentState {
             "logs": self.ui_logs.lock().unwrap().clone(),
             "rpc_logs": self.rpc.tail_logs(50),
             "version": crate::common::sysinfo::app_version(),
-            "firewall_ok": crate::agent::firewall::rules_present(),
+            "firewall_ok": crate::agent::firewall::rpc_rule_scoped_ok(&master_ip),
+            "bootstrap_pending": self.peek_bootstrap().is_some(),
+            "runtime_ok": selfcheck.ok,
+            "runtime_message": selfcheck.message,
         })
     }
 }

@@ -46,6 +46,9 @@ export interface MasterInfo {
   cache_dir: string;
   cache_bytes: number;
   version: string;
+  runtime_ok: boolean;
+  runtime_message: string;
+  local_ips: string[];
 }
 
 export interface AgentStatusView {
@@ -69,6 +72,18 @@ export interface AgentStatusView {
   rpc_logs: string[];
   version: string;
   firewall_ok: boolean;
+  bootstrap_pending: boolean;
+  runtime_ok: boolean;
+  runtime_message: string;
+}
+
+export interface BootstrapToken {
+  id: string;
+  label: string;
+  created_at: number;
+  expires_at: number; // 0 = 长期有效
+  use_count: number;
+  last_used_at: number | null;
 }
 
 export interface PinInfo {

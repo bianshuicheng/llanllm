@@ -132,6 +132,13 @@ onUnmounted(() => {
         <el-button type="primary" :loading="submitting" @click="submitPin">开始配对</el-button>
       </div>
       <p class="hint">PIN 5 分钟内有效。本机信息（主机名/GPU/显存）会通过局域网广播供主控发现。</p>
+      <el-alert
+        v-if="st?.bootstrap_pending"
+        type="success"
+        :closable="false"
+        style="margin-top: 10px"
+        title="检测到安装包内置的引导码：正在自动连接主控，无需手动输入 PIN。若长时间未入网，请确认主控端已启动且与本机在同一局域网。"
+      />
     </el-card>
 
     <!-- 已配对：状态 -->
@@ -173,6 +180,15 @@ onUnmounted(() => {
         :closable="false"
         style="margin-top: 14px"
         title="检测到防火墙规则尚未生效：主控可能无法连接本机 50052 端口。可在主控端重新发起配对，或本机手动放行。"
+      />
+      <el-alert
+        v-if="!st.runtime_ok"
+        type="error"
+        :closable="false"
+        style="margin-top: 14px"
+        :title="`llama.cpp 运行时不可用：${st.runtime_message || '未检测到 runtime 目录'}`"
+        description="通常缺 VC++ 运行库。安装 Microsoft Visual C++ 2015-2022 Redistributable (x64) 后重启本程序即可；或重新安装最新版被控端（已内置）。"
+        show-icon
       />
     </template>
 

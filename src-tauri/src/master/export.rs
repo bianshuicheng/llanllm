@@ -1,11 +1,10 @@
-//! 导出被控端安装包：把引导配置（PIN 等）注入到被控端安装器模板 exe 的尾部。
+//! 导出被控端安装包：把引导配置（引导码 + 主控地址）注入到被控端安装器模板 exe 的尾部。
 
 use crate::common::bootstrap::{build_tail, BootstrapConfig};
 use crate::common::protocol::{CONTROL_PORT, DISCOVERY_PORT, RPC_PORT_DEFAULT};
 use crate::master::state::AppState;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 /// 定位被控端安装器模板。
 /// 优先级：主控 exe 同目录 agent-installer.exe → runtime/agent-installer.exe
@@ -42,24 +41,28 @@ pub fn locate_template() -> Option<PathBuf> {
     None
 }
 
-/// 生成引导 PIN（30 分钟有效）并返回配置。
-pub fn create_bootstrap(state: &Arc<AppState>) -> Result<BootstrapConfig, String> {
-    let pin = crate::common::crypto::gen_pin6();
-    let expires_at = chrono::Utc::now().timestamp() + 1800; // 30 分钟
-    crate::master::pairing::add_pending_pin(state, &pin, Duration::from_secs(1800), "导出引导");
+/// 生成新的引导码（长期有效）并落库。
+/// 主控重启后仍然有效；唯一作废途径是「导出记录」里手动撤销。
+pub fn create_bootstrap(state: &Arc<AppState>, label: &str) -> Result<BootstrapConfig, String> {
+    let token = crate::common::crypto::gen_bootstrap_token();
+    let token_id = crate::common::crypto::bootstrap_token_id(&token);
+    let now = chrono::Utc::now().timestamp();
+    state.db.create_token(&token_id, &token, label, now, 0)?;
+
     Ok(BootstrapConfig {
-        v: 1,
+        v: 3,
         master_id: state.master_id.clone(),
         master_name: state.master_name.clone(),
-        master_ip: crate::common::sysinfo::local_ips()
-            .first()
-            .cloned()
-            .unwrap_or_default(),
-        pin,
+        // 导出时主用网卡 IP（装虚拟机/VPN 的机器上比 local_ips()[0] 可靠）
+        master_ip: crate::common::sysinfo::primary_ip().unwrap_or_default(),
+        pin: String::new(),
+        token_id,
+        token,
         discovery_port: DISCOVERY_PORT,
         ctl_port: CONTROL_PORT,
         rpc_port: RPC_PORT_DEFAULT,
-        expires_at,
+        // 0 = 长期有效，直到在主控界面作废
+        expires_at: 0,
     })
 }
 

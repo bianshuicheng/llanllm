@@ -2,17 +2,19 @@
 import { onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { api } from "../../api";
-import type { NodeView } from "../../types";
+import type { BootstrapToken, NodeView } from "../../types";
 
 const masterCache = ref<{ bytes: number; path: string; human: string } | null>(null);
 const nodes = ref<NodeView[]>([]);
 const nodeCache = ref<Record<string, string>>({});
 const busy = ref<Record<string, boolean>>({});
+const tokens = ref<BootstrapToken[]>([]);
 
 async function refresh() {
   try {
     masterCache.value = await api.masterCacheInfo();
     nodes.value = (await api.getNodes()).filter((n) => n.paired);
+    tokens.value = await api.listBootstrapTokens();
   } catch (e) {
     ElMessage.error(`刷新失败：${e}`);
   }
@@ -97,12 +99,46 @@ async function clearAllNodes() {
   }
 }
 
-async function exportAgent() {
+// —— 导出被控端 ——
+const exportDialog = ref(false);
+const exportLabel = ref("");
+const exporting = ref(false);
+
+function openExportDialog() {
+  exportLabel.value = "";
+  exportDialog.value = true;
+}
+
+async function doExport() {
+  exporting.value = true;
   try {
-    const msg = await api.exportAgentInstaller();
+    const msg = await api.exportAgentInstaller(exportLabel.value.trim() || undefined);
+    exportDialog.value = false;
     ElMessageBox.alert(msg, "导出成功", { confirmButtonText: "好的" }).catch(() => {});
+    refresh();
   } catch (e) {
     if (String(e) !== "已取消") ElMessage.error(String(e));
+  } finally {
+    exporting.value = false;
+  }
+}
+
+function fmtTime(ts: number): string {
+  return new Date(ts * 1000).toLocaleString("zh-CN");
+}
+
+async function revokeToken(t: BootstrapToken) {
+  try {
+    await ElMessageBox.confirm(
+      `作废该引导码（${t.label || "无备注"}）？用它导出的安装包将无法自动入网；已装好并配对的节点不受影响。`,
+      "作废引导码",
+      { type: "warning" },
+    );
+    const msg = await api.revokeBootstrapToken(t.id);
+    ElMessage.success(msg);
+    refresh();
+  } catch {
+    /* 取消 */
   }
 }
 
@@ -182,9 +218,62 @@ onMounted(refresh);
     <el-card shadow="never" style="margin-top: 16px">
       <template #header>导出被控端</template>
       <p class="desc">
-        生成一个「被控端安装包」，拷贝到其他电脑双击安装即可自动入网（预注入主控地址与引导密钥）。
+        生成一个「被控端安装包」：自带主控地址与长期引导码，拷贝到其他电脑双击安装，
+        装完启动即自动入网，全程无需输入 PIN。每个安装包使用独立引导码，可随时作废。
       </p>
-      <el-button type="primary" @click="exportAgent">导出被控端安装包</el-button>
+      <el-button type="primary" @click="openExportDialog">导出被控端安装包…</el-button>
+
+      <el-dialog v-model="exportDialog" title="导出被控端安装包" width="460px">
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          title="安装包会自动放行被控防火墙（仅允许本主控访问），并把引导码注入包内。"
+          style="margin-bottom: 14px"
+        />
+        <el-input v-model="exportLabel" placeholder="备注（可选），如「机房 3 号机」" maxlength="60" />
+        <template #footer>
+          <el-button @click="exportDialog = false">取消</el-button>
+          <el-button type="primary" :loading="exporting" @click="doExport">
+            选择保存位置并导出
+          </el-button>
+        </template>
+      </el-dialog>
+    </el-card>
+
+    <el-card shadow="never" style="margin-top: 16px">
+      <template #header>
+        <div class="head">
+          <span>导出记录（引导码）</span>
+          <el-button size="small" @click="refresh">刷新</el-button>
+        </div>
+      </template>
+      <el-table v-if="tokens.length" :data="tokens" size="small">
+        <el-table-column prop="label" label="备注" min-width="120">
+          <template #default="{ row }">{{ row.label || "-" }}</template>
+        </el-table-column>
+        <el-table-column label="创建时间" min-width="150">
+          <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
+        </el-table-column>
+        <el-table-column label="状态" width="90">
+          <template #default="{ row }">
+            <el-tag v-if="row.expires_at === 0" type="success" size="small">长期有效</el-tag>
+            <el-tag v-else-if="row.expires_at * 1000 > Date.now()" size="small">未过期</el-tag>
+            <el-tag v-else type="info" size="small">已过期</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="已使用" width="150">
+          <template #default="{ row }">
+            {{ row.use_count }} 次{{ row.last_used_at ? ` · 最近 ${fmtTime(row.last_used_at)}` : "" }}
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="90">
+          <template #default="{ row }">
+            <el-button size="small" type="danger" plain @click="revokeToken(row)">作废</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <p v-else class="desc" style="text-align: center; padding: 10px 0">还没有导出记录</p>
     </el-card>
   </div>
 </template>

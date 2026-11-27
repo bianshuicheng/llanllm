@@ -35,6 +35,44 @@ pub struct ModelRow {
     pub status: String,
 }
 
+/// 导出被控端时生成的引导码记录（仅主控使用）。
+/// 引导码落在被控安装包里，被控凭它自动入网；记录持久化在 SQLite，
+/// 因此主控重启后仍然有效，直到过期或在界面被作废。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BootstrapTokenRow {
+    /// 引导码指纹（见 crypto::bootstrap_token_id）
+    pub id: String,
+    /// 引导码本体（机密）：只在配对验证时查库使用，绝不序列化给前端
+    #[serde(skip_serializing)]
+    pub token: String,
+    pub label: String,
+    pub created_at: i64,
+    /// 0 = 长期有效；否则为过期时间（unix 秒）
+    pub expires_at: i64,
+    pub use_count: i64,
+    pub last_used_at: Option<i64>,
+}
+
+impl BootstrapTokenRow {
+    pub fn is_active(&self, now: i64) -> bool {
+        self.expires_at == 0 || self.expires_at > now
+    }
+}
+
+const TOKEN_COLS: &str = "id, token, label, created_at, expires_at, use_count, last_used_at";
+
+fn row_to_token(r: &rusqlite::Row<'_>) -> rusqlite::Result<BootstrapTokenRow> {
+    Ok(BootstrapTokenRow {
+        id: r.get(0)?,
+        token: r.get(1)?,
+        label: r.get(2)?,
+        created_at: r.get(3)?,
+        expires_at: r.get(4)?,
+        use_count: r.get(5)?,
+        last_used_at: r.get(6)?,
+    })
+}
+
 pub struct Db {
     conn: Mutex<Connection>,
 }
@@ -71,7 +109,15 @@ impl Db {
                 source TEXT NOT NULL,
                 quant TEXT,
                 hf_repo TEXT,
-                added_at INTEGER NOT NULL);",
+                added_at INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS bootstrap_tokens(
+                id TEXT PRIMARY KEY,
+                token TEXT NOT NULL,
+                label TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                use_count INTEGER NOT NULL DEFAULT 0,
+                last_used_at INTEGER);",
         )
         .map_err(|e| format!("初始化数据库失败: {e}"))?;
         Ok(Db { conn: Mutex::new(conn) })
@@ -152,6 +198,67 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM nodes WHERE id = ?1", [id])
             .map_err(|e| format!("删除节点失败: {e}"))?;
+        Ok(())
+    }
+
+    // —— bootstrap_tokens（主控：导出的被控端引导码）——
+
+    pub fn create_token(
+        &self,
+        id: &str,
+        token: &str,
+        label: &str,
+        created_at: i64,
+        expires_at: i64,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO bootstrap_tokens(id, token, label, created_at, expires_at, use_count, last_used_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, 0, NULL)",
+            rusqlite::params![id, token, label, created_at, expires_at],
+        )
+        .map_err(|e| format!("写入引导码失败: {e}"))?;
+        Ok(())
+    }
+
+    pub fn list_tokens(&self) -> Vec<BootstrapTokenRow> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn
+            .prepare(&format!("SELECT {TOKEN_COLS} FROM bootstrap_tokens ORDER BY created_at DESC"))
+        {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map([], row_to_token).unwrap_or_else(|_| panic!("引导码查询"));
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// 配对验证用：按指纹取回引导码本体
+    pub fn find_token(&self, id: &str) -> Option<BootstrapTokenRow> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            &format!("SELECT {TOKEN_COLS} FROM bootstrap_tokens WHERE id = ?1"),
+            [id],
+            row_to_token,
+        )
+        .ok()
+    }
+
+    pub fn bump_token_use(&self, id: &str, now: i64) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE bootstrap_tokens SET use_count = use_count + 1, last_used_at = ?2 WHERE id = ?1",
+            rusqlite::params![id, now],
+        )
+        .map_err(|e| format!("更新引导码使用记录失败: {e}"))?;
+        Ok(())
+    }
+
+    /// 作废引导码：此后用它导出的安装包无法再自动入网（已配对的节点不受影响）
+    pub fn delete_token(&self, id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM bootstrap_tokens WHERE id = ?1", [id])
+            .map_err(|e| format!("作废引导码失败: {e}"))?;
         Ok(())
     }
 
@@ -290,5 +397,34 @@ mod tests {
         assert_eq!(db.get_model("m1").unwrap().path, r"F:\new\qwen.gguf");
         db.delete_model("m1").unwrap();
         assert!(db.list_models().is_empty());
+    }
+
+    #[test]
+    fn bootstrap_tokens_lifecycle() {
+        let db = tmp_db("tokens");
+        assert!(db.list_tokens().is_empty());
+        db.create_token("id-forever", "tok-a", "导出", 100, 0).unwrap();
+        db.create_token("id-temp", "tok-b", "导出", 100, 500).unwrap();
+
+        let forever = db.find_token("id-forever").expect("应能查到");
+        assert_eq!(forever.token, "tok-a");
+        assert!(forever.is_active(999_999), "0 = 长期有效");
+        assert!(!db.find_token("id-temp").unwrap().is_active(500));
+        assert!(db.find_token("nope").is_none());
+
+        db.bump_token_use("id-forever", 321).unwrap();
+        db.bump_token_use("id-forever", 654).unwrap();
+        let used = db.find_token("id-forever").unwrap();
+        assert_eq!(used.use_count, 2);
+        assert_eq!(used.last_used_at, Some(654));
+
+        // 引导码本体不能泄漏到序列化结果里（前端列表用）
+        let json = serde_json::to_string(&used).unwrap();
+        assert!(json.contains("id-forever"));
+        assert!(!json.contains("tok-a"));
+
+        db.delete_token("id-temp").unwrap();
+        assert!(db.find_token("id-temp").is_none());
+        assert_eq!(db.list_tokens().len(), 1);
     }
 }

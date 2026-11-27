@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AgentStatusView,
+  BootstrapToken,
   LlamaStatus,
   MasterInfo,
   ModelRow,
@@ -44,7 +45,10 @@ export const api = {
   clearMasterCache: () => invoke<string>("clear_master_cache"),
   masterCacheInfo: () => invoke<{ bytes: number; path: string; human: string }>("master_cache_info"),
   allowDiscoveryFirewall: () => invoke<string>("allow_discovery_firewall"),
-  exportAgentInstaller: () => invoke<string>("export_agent_installer"),
+  exportAgentInstaller: (label?: string) =>
+    invoke<string>("export_agent_installer", { label: label ?? null }),
+  listBootstrapTokens: () => invoke<BootstrapToken[]>("list_bootstrap_tokens"),
+  revokeBootstrapToken: (id: string) => invoke<string>("revoke_bootstrap_token", { id }),
 
   // —— HF 下载 ——
   hfListFiles: (repoId: string) =>

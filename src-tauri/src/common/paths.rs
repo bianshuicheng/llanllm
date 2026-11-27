@@ -45,24 +45,28 @@ pub fn cache_dir() -> PathBuf {
 }
 
 /// llama.cpp runtime（llama-server / ggml-rpc-server + dll）
-/// 优先级：安装目录/runtime（生产） → 源码 binaries/runtime（开发）
+/// 优先级：安装目录/runtime（生产） → 源码 binaries/runtime*（开发）
+/// 主控包只带 llama-server，被控包只带 ggml-rpc-server——任一存在即认定 runtime 目录。
 pub fn runtime_dir() -> Option<PathBuf> {
+    let markers = ["llama-server.exe", "ggml-rpc-server.exe"];
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             let p = parent.join("runtime");
-            if p.join("llama-server.exe").exists() {
+            if markers.iter().any(|m| p.join(m).exists()) {
                 return Some(p);
             }
             // 直接和主程序放在一起也接受
-            if parent.join("llama-server.exe").exists() {
+            if markers.iter().any(|m| parent.join(m).exists()) {
                 return Some(parent.to_path_buf());
             }
         }
     }
     if let Some(manifest) = option_env!("CARGO_MANIFEST_DIR") {
-        let p = PathBuf::from(manifest).join("binaries").join("runtime");
-        if p.join("llama-server.exe").exists() {
-            return Some(p);
+        for sub in ["binaries/runtime", "binaries/runtime-master", "binaries/runtime-agent"] {
+            let p = PathBuf::from(manifest).join(sub);
+            if markers.iter().any(|m| p.join(m).exists()) {
+                return Some(p);
+            }
         }
     }
     None

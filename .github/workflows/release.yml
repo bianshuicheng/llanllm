@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Download llama.cpp runtime (pinned b12318, CPU x64)
+        shell: pwsh
+        run: |
+          $tag = "b12318"
+          $url = "https://github.com/ggml-org/llama.cpp/releases/download/$tag/llama-$tag-bin-win-cpu-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile llama.zip
+          Expand-Archive llama.zip -DestinationPath staging
+          New-Item -ItemType Directory -Force -Path src-tauri/binaries/runtime-master, src-tauri/binaries/runtime-agent | Out-Null
+
+          # 主控：llama-server + 依赖链 + RPC 客户端后端 + 被控安装器模板（随后放入）
+          $master = "llama-server.exe","llama-server-impl.dll","llama-common.dll","llama.dll","mtmd.dll","ggml-base.dll","ggml.dll","ggml-rpc.dll","libomp.dll","LICENSE-LLVM-OpenMP"
+          # 被控：只需 rpc-server + ggml 后端（rpc-server 动态加载，不需要任何 llama*.dll）
+          $agent  = "ggml-rpc-server.exe","ggml-rpc.dll","ggml-base.dll","ggml.dll","libomp.dll","LICENSE-LLVM-OpenMP"
+          foreach ($f in $master) { Copy-Item "staging/$f" "src-tauri/binaries/runtime-master/" }
+          foreach ($f in $agent)  { Copy-Item "staging/$f" "src-tauri/binaries/runtime-agent/" }
+          Copy-Item staging/ggml-cpu-*.dll src-tauri/binaries/runtime-master/
+          Copy-Item staging/ggml-cpu-*.dll src-tauri/binaries/runtime-agent/
+
+          # VC++ 运行库随包携带（llama.cpp 全部二进制依赖 MSVCP140/VCRUNTIME140，
+          # 干净机器上没有 → v0.1.0 换环境报错的直接原因）。runner 自带 VS，取 System32。
+          foreach ($d in "runtime-master","runtime-agent") {
+            foreach ($dll in "vcruntime140.dll","vcruntime140_1.dll","msvcp140.dll") {
+              Copy-Item "C:\Windows\System32\$dll" "src-tauri/binaries/$d/"
+            }
+          }
+
+          # 运行时冒烟：版本命令退出码必须为 0（顺带证明 VC DLL 复制后可加载）
+          & src-tauri/binaries/runtime-master/llama-server.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "llama-server selfcheck failed: $LASTEXITCODE" }
+          Write-Host "llama.cpp runtime ready ($tag)"
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Unit tests (both roles)
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --features master
+          cargo test --manifest-path src-tauri/Cargo.toml --features agent
+
+      - name: Build agent installer (template for master)
+        run: npm run build:agent
+
+      - name: E2E — inject bootstrap, install agent silently, verify config.json
+        shell: pwsh
+        env:
+          LLAN_AGENT_INSTALLER: ${{ github.workspace }}\src-tauri\target\release\bundle\nsis\LLM被控端_0.1.1_x64-setup.exe
+        run: cargo test --manifest-path src-tauri/Cargo.toml --features master --test exported_installer -- --nocapture
+
+      - name: Place agent installer as master template
+        shell: pwsh
+        run: |
+          Copy-Item "src-tauri/target/release/bundle/nsis/LLM被控端_0.1.1_x64-setup.exe" "src-tauri/binaries/runtime-master/agent-installer.exe"
+          Get-Item src-tauri/binaries/runtime-master/agent-installer.exe | Select-Object Name, Length
+
+      - name: Build master installer
+        run: npm run build:master
+
+      - name: Sanity-check master installer payload
+        shell: pwsh
+        run: |
+          $p = "src-tauri/target/release/bundle/nsis/LLM主控台_0.1.1_x64-setup.exe"
+          if (-not (Test-Path $p)) { throw "master installer missing" }
+          $size = (Get-Item $p).Length
+          Write-Host "master installer: $size bytes"
+          if ($size -gt 150MB) { throw "master installer over 150MB budget" }
+          $a = "src-tauri/target/release/bundle/nsis/LLM被控端_0.1.1_x64-setup.exe"
+          if ((Get-Item $a).Length -gt 80MB) { throw "agent installer over 80MB budget" }
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/release/bundle/nsis/LLM主控台_0.1.1_x64-setup.exe
+          body_path: .github/RELEASE_BODY.md
+          fail_on_unmatched_files: true

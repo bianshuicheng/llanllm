@@ -38,6 +38,9 @@ pub struct CtlSession {
     seq_tx: Arc<AtomicU64>,
     pending: PendingMap,
     writer: mpsc::Sender<Vec<u8>>,
+    /// 被控的真实连接 IP（TCP 对端）：RPC 拨号、防火墙下发都用它，
+    /// 比心跳广播里的 IP 列表更可靠（多网卡机器）
+    pub peer_ip: String,
 }
 
 impl CtlSession {
@@ -113,7 +116,8 @@ async fn handle_conn(
     }
 }
 
-/// 被控发起配对：PairHello → PairAck → AEAD PairProof（试每个待验证 PIN）→ AEAD PairDone
+/// 被控发起配对：PairHello → PairAck → AEAD PairProof（试每个有效凭证）→ AEAD PairDone
+/// 凭证两类：安装包注入的引导码（持久化在 DB，长期有效/可作废）、手动配对 PIN（内存，5 分钟）
 async fn do_pairing(
     app: AppHandle,
     state: Arc<AppState>,
@@ -121,7 +125,7 @@ async fn do_pairing(
     peer: SocketAddr,
     hello: HandshakeMsg,
 ) -> Result<(), String> {
-    let HandshakeMsg::PairHello { id, epk, salt, hostname, gpu, vram_total_mb, version } = hello
+    let HandshakeMsg::PairHello { id, epk, salt, hostname, gpu, vram_total_mb, version, token_id } = hello
     else {
         return Err("内部错误".into());
     };
@@ -147,39 +151,77 @@ async fn do_pairing(
     .await
     .map_err(|e| format!("发送 PairAck 失败: {e}"))?;
 
-    // 读 PIN 证明
+    // 读凭证证明
     let proof_frame = read_frame(&mut stream)
         .await
-        .map_err(|e| format!("等待 PIN 证明失败: {e}"))?;
+        .map_err(|e| format!("等待凭证证明失败: {e}"))?;
 
-    // 逐个尝试待验证 PIN
-    let candidates: Vec<(usize, String)> = {
-        let pins = state.pending_pins.lock().unwrap();
-        pins.iter()
-            .enumerate()
-            .filter(|(_, e)| !e.expired())
-            .map(|(i, e)| (i, e.pin.clone()))
-            .collect()
-    };
-    let mut matched: Option<(usize, [u8; 32], [u8; 32])> = None; // (idx, k_i2r, k_r2i)
-    for (idx, pin) in candidates {
-        let mut salt_pin = salt_bytes.clone();
-        salt_pin.extend_from_slice(pin.as_bytes());
-        let (k_i2r, k_r2i) = derive_session_keys(&shared, &salt_pin);
+    // 汇总候选凭证：库里的引导码（含过期检查）+ 内存中的待验证 PIN
+    enum Credential {
+        Token(String), // 引导码 id
+        Pin(usize),    // pending_pins 下标
+    }
+    let now = chrono::Utc::now().timestamp();
+    let mut candidates: Vec<(String, Credential)> = Vec::new();
+    if !token_id.is_empty() {
+        if let Some(row) = state.db.find_token(&token_id) {
+            if row.is_active(now) {
+                candidates.push((row.token, Credential::Token(row.id)));
+            } else {
+                eprintln!("[ctl-server] pair attempt with expired token {token_id} from {peer}");
+            }
+        } else {
+            eprintln!("[ctl-server] pair attempt with unknown token {token_id} from {peer}");
+        }
+    }
+    for (idx, e) in state
+        .pending_pins
+        .lock()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.expired())
+    {
+        candidates.push((e.pin.clone(), Credential::Pin(idx)));
+    }
+
+    // 逐个试 AEAD 证明：能解开即持有正确凭证
+    let mut matched: Option<([u8; 32], [u8; 32], Credential)> = None; // (k_i2r, k_r2i, cred)
+    for (secret, cred) in &candidates {
+        let mut salt_secret = salt_bytes.clone();
+        salt_secret.extend_from_slice(secret.as_bytes());
+        let (k_i2r, k_r2i) = derive_session_keys(&shared, &salt_secret);
         if aead_open(&k_i2r, 0, DIR_I2R, &proof_frame, b"pair").is_ok() {
-            matched = Some((idx, k_i2r, k_r2i));
+            matched = Some((k_i2r, k_r2i, match cred {
+                Credential::Token(t) => Credential::Token(t.clone()),
+                Credential::Pin(i) => Credential::Pin(*i),
+            }));
             break;
         }
     }
-    let Some((idx, k_i2r, k_r2i)) = matched else {
+    let Some((k_i2r, k_r2i, cred)) = matched else {
         write_json_frame(
             &mut stream,
-            &HandshakeMsg::PairFail { reason: "PIN 不正确或已过期".into() },
+            &HandshakeMsg::PairFail { reason: "凭证不正确或已失效".into() },
         )
         .await
         .ok();
-        return Err("PIN 不匹配".into());
+        return Err("凭证不匹配".into());
     };
+
+    // 凭证命中后的处理：引导码记使用次数；PIN 消费掉
+    match &cred {
+        Credential::Token(tid) => {
+            let _ = state.db.bump_token_use(tid, chrono::Utc::now().timestamp());
+            eprintln!("[ctl-server] paired via bootstrap token {tid}");
+        }
+        Credential::Pin(idx) => {
+            let mut pins = state.pending_pins.lock().unwrap();
+            if *idx < pins.len() {
+                pins.remove(*idx);
+            }
+        }
+    }
 
     // 配对完成（AEAD）
     let done = HandshakeMsg::PairDone {
@@ -214,13 +256,6 @@ async fn do_pairing(
             live.paired = true;
         }
     }
-    // 消费对应 PIN
-    {
-        let mut pins = state.pending_pins.lock().unwrap();
-        if idx < pins.len() {
-            pins.remove(idx);
-        }
-    }
     app.emit(
         "pair-success",
         serde_json::json!({
@@ -233,7 +268,7 @@ async fn do_pairing(
     .ok();
 
     eprintln!("[ctl-server] paired session for {id} ({}) established", row.hostname);
-    promote_and_read(app, state, id, stream, k_i2r, k_r2i, 1, 1).await
+    promote_and_read(app, state, id, stream, k_i2r, k_r2i, 1, 1, ip).await
 }
 
 /// 已配对被控的会话重建
@@ -291,10 +326,11 @@ async fn do_ctl(
     }
 
     eprintln!("[ctl-server] session for {id} ({}) re-established", node.hostname);
-    promote_and_read(app, state, id, stream, k_i2r, k_r2i, 0, 0).await
+    promote_and_read(app, state, id, stream, k_i2r, k_r2i, 0, 0, peer.ip().to_string()).await
 }
 
 /// 会话登记 + 读循环。断开时清理会话并失败所有等待者。
+#[allow(clippy::too_many_arguments)]
 async fn promote_and_read(
     app: AppHandle,
     state: Arc<AppState>,
@@ -304,6 +340,7 @@ async fn promote_and_read(
     k_r2i: [u8; 32],
     seq_tx0: u64,
     seq_rx0: u64,
+    peer_ip: String,
 ) -> Result<(), String> {
     let (mut read_half, write_half) = stream.into_split();
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -325,7 +362,13 @@ async fn promote_and_read(
         }
     });
 
-    let session = CtlSession { send_key, seq_tx, pending: Arc::clone(&pending), writer: tx };
+    let session = CtlSession {
+        send_key,
+        seq_tx,
+        pending: Arc::clone(&pending),
+        writer: tx,
+        peer_ip,
+    };
     state.ctl_sessions.lock().unwrap().insert(node_id.clone(), Arc::new(session));
     emit_nodes(&app, &state);
 

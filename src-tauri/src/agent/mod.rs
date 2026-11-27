@@ -29,6 +29,7 @@ pub fn run() {
             // 读取安装包注入的引导配置，自动完成配对（无需手动输入 PIN）。
             // 两个来源：1) 安装目录 config.json（NSIS 安装器写入）
             //          2) 自身 exe 尾部的注入标记（直接运行导出的 exe 时）
+            // 引导码长期有效（可被主控作废），过期只在界面上提示但不阻断。
             if !state.is_paired() {
                 let cfg_from_json = std::env::current_exe().ok().and_then(|exe| {
                     let dir = exe.parent()?.to_path_buf();
@@ -45,18 +46,16 @@ pub fn run() {
                     if !master_ip.is_empty() {
                         state.set_addr_hint(&master_ip, cfg.ctl_port);
                     }
-                    if cfg.expires_at <= chrono::Utc::now().timestamp() {
+                    state.set_bootstrap(&cfg.token_id, &cfg.token);
+                    if cfg.expired(chrono::Utc::now().timestamp()) {
                         state.push_ui_log(
-                            "安装包中的引导 PIN 已过期，请手动输入主控显示的 PIN 配对。".into(),
+                            "安装包中的引导码已过期，请到主控重新导出安装包，或手动输入 PIN。".into(),
                         );
                     } else {
                         state.push_ui_log(format!(
                             "检测到安装包注入的引导配置（主控「{}」@ {master_ip}），自动配对中…",
                             cfg.master_name
                         ));
-                        if let Err(e) = state.submit_pending_pin(&cfg.pin) {
-                            state.push_ui_log(format!("自动配对失败：{e}"));
-                        }
                     }
                 }
             }

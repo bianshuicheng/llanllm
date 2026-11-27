@@ -1,5 +1,4 @@
-//! 提权执行 PowerShell 脚本（UAC 弹窗），用于防火墙规则等系统级操作。
-//! 主控/被控共用。
+//! 提权执行脚本（UAC 弹窗），用于防火墙规则等系统级操作。主控/被控共用。
 
 use std::path::Path;
 use std::process::Command;
@@ -20,18 +19,29 @@ impl HideWindow for Command {
     }
 }
 
-/// 写脚本文件并以管理员身份运行，等待完成并返回是否成功。
-/// 用户取消 UAC → Err。脚本自身的输出会透传回来辅助排错。
-pub fn run_elevated_script(script_path: &Path, window_title: &str) -> Result<String, String> {
-    let script = script_path
-        .to_str()
-        .ok_or("脚本路径含非法字符")?
-        .replace('\'', "''");
+/// 把 Windows 的退出码翻译成中文原因。
+/// 常见值来自 PowerShell/consent.exe 的惯例（1/1223 = 用户取消 UAC）。
+pub fn explain_exit_code(code: i32) -> String {
+    match code {
+        0 => "成功".into(),
+        1 => "操作被用户取消（UAC 弹窗点了「否」或直接关闭）".into(),
+        1223 => "操作被用户取消（UAC 弹窗点了「否」）".into(),
+        -1 => "提权请求被拒绝（UAC 被取消）".into(),
+        2 => "系统找不到指定的文件".into(),
+        5 => "拒绝访问（权限不足）".into(),
+        1602 => "操作被用户取消".into(),
+        1603 => "安装过程中发生致命错误".into(),
+        3010 => "成功，但需要重启才能完全生效".into(),
+        _ => format!("退出码 {code}"),
+    }
+}
 
-    // 内层：以管理员身份运行目标脚本；外层：等待并取回退出码
+/// Start-Process RunAs 提权运行某个程序并等待退出码。
+/// `arguments` 会原样拼在 -ArgumentList 里（调用方负责引号）。
+fn run_as(program: &str, arguments: &str, window_title: &str) -> Result<String, String> {
     let inner = format!(
-        "$p = Start-Process powershell -Verb RunAs -PassThru -Wait -WindowStyle Hidden \
-         -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{script}'; \
+        "$p = Start-Process {program} -Verb RunAs -PassThru -Wait -WindowStyle Hidden \
+         -ArgumentList {arguments}; \
          exit $p.ExitCode"
     );
     let out = Command::new("powershell")
@@ -43,17 +53,44 @@ pub fn run_elevated_script(script_path: &Path, window_title: &str) -> Result<Str
     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
     let code = out.status.code().unwrap_or(-1);
-    if code == -1 {
-        return Err(format!(
-            "提权请求被拒绝或失败（UAC 被取消？）\n{window_title}\n{stderr}"
-        ));
+    if code == 0 {
+        return Ok(stdout);
     }
-    if code != 0 {
-        return Err(format!(
-            "管理员操作失败（退出码 {code}）\n{stdout}\n{stderr}"
-        ));
-    }
-    Ok(stdout)
+    Err(format!(
+        "{window_title}失败：{}\n{}",
+        explain_exit_code(code),
+        if stderr.is_empty() { stdout } else { stderr }
+    ))
+}
+
+/// 清理路径里可能引入的引号（防注入/防参数拆分）
+fn sanitize_path(p: &Path) -> Result<String, String> {
+    Ok(p.to_str()
+        .ok_or("脚本路径含非法字符")?
+        .replace(['"', '\''], ""))
+}
+
+/// 以管理员身份运行 .cmd 批处理脚本（防火墙 netsh 用）。
+/// 路径带引号：用户名/安装目录含空格时（如 C:\Users\Li Na\...）不加引号必然失败。
+pub fn run_elevated_cmd(script_path: &Path, window_title: &str) -> Result<String, String> {
+    let script = sanitize_path(script_path)?;
+    run_as(
+        "cmd.exe",
+        &format!("'/c','\"{script}\"'"),
+        window_title,
+    )
+}
+
+/// 以管理员身份运行 PowerShell 脚本（复杂逻辑用）。
+pub fn run_elevated_script(script_path: &Path, window_title: &str) -> Result<String, String> {
+    let script = sanitize_path(script_path)?;
+    run_as(
+        "powershell",
+        &format!(
+            "'-NoProfile','-ExecutionPolicy','Bypass','-File','\"{script}\"'"
+        ),
+        window_title,
+    )
 }
 
 /// 运行一段非提权 PowerShell 并捕获 stdout
@@ -64,7 +101,31 @@ pub fn run_ps(script: &str) -> Result<String, String> {
         .output()
         .map_err(|e| format!("PowerShell 执行失败: {e}"))?;
     if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        return Err(format!(
+            "PowerShell 执行失败（{}）",
+            explain_exit_code(out.status.code().unwrap_or(-1))
+        ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_code_explanations() {
+        assert_eq!(explain_exit_code(0), "成功");
+        assert!(explain_exit_code(1).contains("取消"));
+        assert!(explain_exit_code(1223).contains("取消"));
+        assert!(explain_exit_code(999).contains("999"));
+    }
+
+    #[test]
+    fn sanitize_strips_quotes() {
+        let p = Path::new("C:\\Users\\Li Na\\fw.cmd");
+        assert_eq!(sanitize_path(p).unwrap(), "C:\\Users\\Li Na\\fw.cmd");
+        let bad = Path::new("C:\\We\"ird'path.cmd");
+        assert_eq!(sanitize_path(bad).unwrap(), "C:\\Weirdpath.cmd");
+    }
 }

@@ -1,9 +1,10 @@
 //! 被控端控制客户端：主动连接主控 47891（出站，被控零入站防火墙）。
 //!
-//! - 未配对 + 有 PIN（手动输入或安装包注入）+ 已发现主控地址 → 发起配对
-//!   （PairHello → PairAck → AEAD PairProof（证明持有 PIN）→ AEAD PairDone）
+//! - 未配对 + 有凭证（安装包注入的引导码 或 手动输入的 6 位 PIN）+ 已发现主控
+//!   → 发起配对（PairHello → PairAck → AEAD PairProof → AEAD PairDone）
+//!   凭证随 PairHello 明文携带指纹、密文帧证明持有本体，主控在库中核对
 //! - 已配对 → 用 node_key 建立持久控制会话，接收主控指令并应答
-//! - 断线自动重连（指数退避）
+//! - 断线自动重连（指数退避，上限 10s）
 
 use crate::agent::state::AgentState;
 use crate::common::crypto::{
@@ -15,7 +16,6 @@ use crate::common::protocol::{
     HandshakeMsg,
 };
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::TcpStream;
 use x25519_dalek::PublicKey;
 
@@ -27,46 +27,51 @@ pub async fn run_ctl_client(state: Arc<AgentState>) {
     loop {
         let paired = state.is_paired();
         let pin = if paired { None } else { state.peek_pending_pin() };
+        let bootstrap = if paired { None } else { state.peek_bootstrap() };
         let addr = state.pick_master_addr();
 
-        match (paired, pin, addr) {
+        match (paired, &addr) {
             // 已配对：维持控制会话
-            (true, _, Some(addr)) => match ctl_session(&state, &addr).await {
-                Ok(()) => {
-                    backoff = 2;
-                }
-                Err(e) => {
+            (true, Some(addr)) => {
+                if let Err(e) = ctl_session(&state, addr).await {
                     state.push_ui_log(format!("控制会话断开：{e}，稍后自动重连"));
-                }
-            },
-            // 未配对 + 有 PIN + 已发现主控：主动配对
-            (false, Some(pin), Some(addr)) => match try_pair(&state, &addr, &pin).await {
-                Ok(()) => {
+                } else {
                     backoff = 2;
                 }
-                Err(e) => {
-                    state.push_ui_log(format!(
+            }
+            // 未配对 + 凭证 + 已发现主控：主动配对
+            (false, Some(addr)) => {
+                let attempt = match (&bootstrap, &pin) {
+                    (Some((tid, tok)), _) => try_pair(&state, addr, tid.clone(), Some(tok.clone())).await,
+                    (_, Some(p)) => try_pair(&state, addr, String::new(), Some(p.clone())).await,
+                    _ => Ok(()),
+                };
+                match attempt {
+                    Ok(()) => backoff = 2,
+                    Err(e) => state.push_ui_log(format!(
                         "配对尝试失败（{}:{}）：{e}",
                         addr.0, addr.1
-                    ));
+                    )),
                 }
-            },
+            }
             // 未配对且还没发现主控：安静等待心跳/存在应答
             _ => {}
         }
-        tokio::time::sleep(Duration::from_secs(backoff)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(10);
     }
 }
 
-/// 主动配对：配对成功后同一连接直接转为控制会话（keys 延续）。
+/// 主动配对：`secret` 为 Some 时放进 PIN 证明帧（引导码或 6 位 PIN）。
+/// 配对成功后同一连接直接转为控制会话（keys 延续）。
 async fn try_pair(
     state: &Arc<AgentState>,
     addr: &(String, u16),
-    pin: &str,
+    token_id: String,
+    secret: Option<String>,
 ) -> Result<(), String> {
     let addr_str = format!("{}:{}", addr.0, addr.1);
-    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr_str))
+    let mut stream = tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(&addr_str))
         .await
         .map_err(|_| "连接主控超时".to_string())?
         .map_err(|e| format!("连接失败: {e}"))?;
@@ -84,6 +89,7 @@ async fn try_pair(
             gpu: gpu.name.clone(),
             vram_total_mb: gpu.vram_total_mb,
             version: crate::common::sysinfo::app_version(),
+            token_id,
         },
     )
     .await
@@ -112,18 +118,19 @@ async fn try_pair(
     // salt 即本端生成的原始字节（线上是它的 hex 编码），无需再解码
     let peer = PublicKey::from(epk_bytes);
     let shared = ecdh(&sk, &peer);
-    let mut salt_pin = salt;
-    salt_pin.extend_from_slice(pin.as_bytes());
-    let (k_i2r, k_r2i) = derive_session_keys(&shared, &salt_pin);
+    let mut salt_secret = salt;
+    let secret = secret.unwrap_or_default();
+    salt_secret.extend_from_slice(secret.as_bytes());
+    let (k_i2r, k_r2i) = derive_session_keys(&shared, &salt_secret);
 
-    // PIN 证明（AEAD）
+    // 凭证证明（AEAD，主控逐个核对凭证）
     let proof = HandshakeMsg::PairProof;
     let sealed = aead_seal(&k_i2r, 0, DIR_I2R, &serde_json::to_vec(&proof).unwrap(), b"pair");
     write_frame(&mut stream, &sealed)
         .await
-        .map_err(|e| format!("发送 PIN 证明失败: {e}"))?;
+        .map_err(|e| format!("发送凭证证明失败: {e}"))?;
 
-    // 等待 PairDone（主控持有正确 PIN 才能产生）
+    // 等待 PairDone（主控持有正确凭证才能产生）
     let sealed2 = read_frame(&mut stream)
         .await
         .map_err(|e| format!("等待配对确认失败: {e}"))?;
@@ -139,11 +146,12 @@ async fn try_pair(
     let ip = addr.0.clone();
     state.complete_pairing(&node_key, &done_master_id, &done_master_name, &ip)?;
     state.take_pending_pin();
+    state.clear_bootstrap();
     state.push_ui_log(format!(
         "配对成功：主控「{done_master_name}」({ip})，node_key 已加密保存"
     ));
 
-    // 配对成功后立即做两件事（不阻塞会话）：防火墙收紧 + 启动 rpc-server
+    // 配对成功后立即做两件事（不阻塞会话）：启动 rpc-server + 防火墙收紧
     {
         let st = Arc::clone(state);
         tauri::async_runtime::spawn(async move {
@@ -158,14 +166,18 @@ async fn try_pair(
     }
     {
         let st = Arc::clone(state);
-        let ip2 = ip.clone();
+        let master_ips = vec![ip.clone()];
         tauri::async_runtime::spawn(async move {
-            if crate::agent::firewall::rpc_rule_scoped_ok(&ip2) {
+            let first = master_ips.first().cloned().unwrap_or_default();
+            if crate::agent::firewall::rpc_rule_scoped_ok(&first) {
                 st.push_ui_log("防火墙规则已就绪（50052 仅允许主控访问）".to_string());
                 return;
             }
-            match crate::agent::firewall::apply_scoped_rules(&ip2) {
-                Ok(()) => st.push_ui_log(format!("防火墙规则已更新：50052 仅允许主控 {ip2} 访问")),
+            match crate::agent::firewall::apply_scoped_rules(&master_ips) {
+                Ok(()) => st.push_ui_log(format!(
+                    "防火墙规则已更新：50052 仅允许主控（{}）访问",
+                    master_ips.join(", ")
+                )),
                 Err(e) => st.push_ui_log(format!(
                     "防火墙规则设置失败：{e}（若安装时已放行可忽略；主控可能无法连接本机 RPC）"
                 )),
@@ -184,7 +196,7 @@ async fn ctl_session(state: &Arc<AgentState>, addr: &(String, u16)) -> Result<()
     let expect_master = state.master_id().ok_or("未配对")?;
     let addr_str = format!("{}:{}", addr.0, addr.1);
 
-    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr_str))
+    let mut stream = tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(&addr_str))
         .await
         .map_err(|_| "连接主控超时".to_string())?
         .map_err(|e| format!("连接失败: {e}"))?;
@@ -239,7 +251,6 @@ async fn ctl_session(state: &Arc<AgentState>, addr: &(String, u16)) -> Result<()
 
     // 首条指令兼做双向认证（两端都必须持有 node_key）
     state.push_ui_log(format!("已连接主控 {}:{}", addr.0, addr.1));
-    let _ = addr_str;
     serve_session(state, stream, Aead::new(k_i2r), Aead::new(k_r2i), 0, 0).await
 }
 
@@ -317,25 +328,47 @@ async fn dispatch(state: &Arc<AgentState>, req: &CtlRequest) -> CtlResponse {
             Ok(()) => CtlResponse::ok(id, serde_json::json!({"stopped": true})),
             Err(e) => CtlResponse::err(id, 500, e),
         },
+        // 主控启动推理前调用：返回主控应拨号的本机地址与会话对端信息。
+        // 主控优先使用真实连接 IP，避免心跳里多网卡 IP 顺序不稳定导致连错网卡。
+        "rpc.targets" => {
+            let free = state.refresh_vram_free();
+            CtlResponse::ok(id, serde_json::json!({
+                "rpc_port": state.rpc.port(),
+                "ips": crate::common::sysinfo::local_ips(),
+                "vram_free_mb": free.or(state.gpu.vram_free_mb),
+            }))
+        }
         "cache.info" => CtlResponse::ok(id, serde_json::json!({ "bytes": state.cache_bytes() })),
         "cache.clear" => match state.clear_cache() {
             Ok(msg) => CtlResponse::ok(id, serde_json::json!(msg)),
             Err(e) => CtlResponse::err(id, 500, e),
         },
         "firewall.setup" => {
-            let master_ip = req
+            let master_ips: Vec<String> = req
+                .params
+                .get("master_ips")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let legacy: Option<String> = req
                 .params
                 .get("master_ip")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            if master_ip.is_empty() {
-                return CtlResponse::err(id, 400, "缺少 master_ip");
+                .and_then(|v| v.as_str().map(String::from));
+            let mut ips = master_ips;
+            if ips.is_empty() {
+                if let Some(ip) = legacy {
+                    if !ip.is_empty() {
+                        ips.push(ip);
+                    }
+                }
+            }
+            if ips.is_empty() {
+                return CtlResponse::err(id, 400, "缺少 master_ips");
             }
             let st = Arc::clone(state);
             tauri::async_runtime::spawn(async move {
-                match crate::agent::firewall::apply_scoped_rules(&master_ip) {
-                    Ok(()) => st.push_ui_log(format!("防火墙规则已更新（{master_ip}）")),
+                match crate::agent::firewall::apply_scoped_rules(&ips) {
+                    Ok(()) => st.push_ui_log("防火墙规则已更新（仅主控可访问 50052）"),
                     Err(e) => st.push_ui_log(format!("防火墙规则失败：{e}")),
                 }
                 st.emit_state();

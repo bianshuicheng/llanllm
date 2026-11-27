@@ -153,6 +153,29 @@ pub fn gen_pin6() -> String {
     format!("{:06}", OsRng.next_u32() % 1_000_000)
 }
 
+/// 导出被控端用的引导码：128 位随机数（32 个十六进制字符）。
+/// 只随安装包传递、不需要人工输入，因此不像 6 位 PIN 那样可被在线/离线穷举，
+/// 可以长期有效。
+pub fn gen_bootstrap_token() -> String {
+    hex::encode(random_bytes(16))
+}
+
+/// 引导码指纹：sha256 的前 16 个十六进制字符。非机密，用于主控定位库里的记录，
+/// 以及界面上区分不同的引导码。
+pub fn bootstrap_token_id(token: &str) -> String {
+    sha256_hex(token.as_bytes())[..16].to_string()
+}
+
+/// 界面展示用：每 8 个字符一组
+pub fn format_bootstrap_token(token: &str) -> String {
+    token
+        .as_bytes()
+        .chunks(8)
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 // —— DPAPI（Windows）——
 
 /// 用 DPAPI（用户作用域）加密持久化长期密钥。
@@ -247,6 +270,18 @@ mod tests {
         let p = gen_pin6();
         assert_eq!(p.len(), 6);
         assert!(p.bytes().all(|b| b.is_ascii_digit()));
+    }
+
+    #[test]
+    fn bootstrap_token_shape() {
+        let t = gen_bootstrap_token();
+        assert_eq!(t.len(), 32);
+        assert!(t.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(t, gen_bootstrap_token());
+        let id = bootstrap_token_id(&t);
+        assert_eq!(id.len(), 16);
+        assert_eq!(id, bootstrap_token_id(&t));
+        assert_eq!(format_bootstrap_token(&t), format!("{}-{}-{}-{}", &t[..8], &t[8..16], &t[16..24], &t[24..]));
     }
 
     #[test]
